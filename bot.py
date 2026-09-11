@@ -4,9 +4,9 @@ Referal-konkurs Telegram boti.
 Render "Web Service" + MongoDB Atlas uchun moslashtirilgan.
 
 Kerakli muhit o'zgaruvchilari (Render -> Environment):
-    BOT_TOKEN     - @BotFather dan olingan token (SHART)
-    ADMIN_IDS     - admin(lar)ning Telegram ID raqami, vergul bilan: "111,222" (SHART)
-    BOT_USERNAME  - bot username'i, @ belgisiz (SHART)
+    BOT_TOKEN     - 8842754251:AAEe-w4OUzSc0CJip0KVdrwIBq_xW9D6xUo
+    ADMIN_IDS     - 8866852203
+    BOT_USERNAME  - Bloxfruitkonkurs_bot
     MONGO_URI     - MongoDB ulanish manzili (ixtiyoriy, kodda standart qiymat bor)
     PORT          - Render avtomatik beradi, o'zingiz sozlamang
 """
