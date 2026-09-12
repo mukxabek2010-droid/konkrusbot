@@ -51,7 +51,7 @@ SELF_URL = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("SELF_URL", "")
 SELF_PING_INTERVAL_SECONDS = 4 * 60  # har 4 daqiqada
 
 # "Fruit Value" bo'limida ochiladigan WebApp havolasi (Render -> Environment -> FRUIT_VALUE_URL)
-FRUIT_VALUE_URL = os.getenv("FRUIT_VALUE_URL", "https://example.com")
+FRUIT_VALUE_URL = os.getenv("FRUIT_VALUE_URL", "https://www.gamersberg.com/blox-fruits/calculator")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN muhit o'zgaruvchisi topilmadi! Render -> Environment bo'limida qo'shing.")
