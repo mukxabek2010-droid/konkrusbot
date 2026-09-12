@@ -14,6 +14,7 @@ Kerakli muhit o'zgaruvchilari (Render -> Environment):
 import asyncio
 import logging
 import os
+import random
 from datetime import datetime
 
 from aiohttp import web, ClientSession, ClientTimeout
@@ -82,6 +83,13 @@ class AdminStates(StatesGroup):
     waiting_gift_amount = State()
 
 
+class Contest2States(StatesGroup):
+    waiting_description = State()
+    waiting_channels = State()
+    waiting_winners_count = State()
+    waiting_photo = State()
+
+
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
@@ -124,6 +132,7 @@ def admin_panel_keyboard(contest_running: bool):
 
     builder.row(InlineKeyboardButton(text="🏆 G'olibni e'lon qilish", callback_data="adm_declare_winner"))
     builder.row(InlineKeyboardButton(text="🔄 Joriy hisobni qo'lda nolga tushirish", callback_data="adm_reset"))
+    builder.row(InlineKeyboardButton(text="🎉 KONKURS 2 (kanalga post + random)", callback_data="c2_menu"))
     return builder.as_markup()
 
 
@@ -793,6 +802,276 @@ async def cb_adm_reset_confirm(callback: CallbackQuery):
     await db.reset_current_round()
     await callback.message.edit_text(
         "✅ Joriy tur referal hisoblari nolga tushirildi. Umumiy reyting o'zgarmadi.",
+        reply_markup=back_to_admin_keyboard(),
+    )
+    await callback.answer()
+
+
+# ==================== KONKURS 2 (kanalga post + tasodifiy g'olib) ====================
+
+def _c2_parse_channels(text: str):
+    """Har qatordagi kanal linkidan chat_id (@username) va to'liq url ajratib oladi."""
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    channels = []
+    for line in lines:
+        username = (
+            line.replace("https://t.me/", "")
+            .replace("http://t.me/", "")
+            .replace("t.me/", "")
+            .lstrip("@")
+            .strip()
+        )
+        if not username:
+            continue
+        url = line if line.startswith("http") else f"https://t.me/{username}"
+        channels.append({"chat_id": f"@{username}", "url": url})
+    return channels
+
+
+@admin_router.callback_query(F.data == "c2_menu")
+async def cb_c2_menu(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    state = await db.get_contest2_state()
+    builder = InlineKeyboardBuilder()
+
+    if state.get("active"):
+        participants = state.get("participants", [])
+        text = (
+            "🎉 <b>KONKURS 2</b>\n\n"
+            "Holat: 🟢 Faol (e'lon qilingan)\n"
+            f"👥 Hozirgi ishtirokchilar: <b>{len(participants)}</b>\n"
+            f"🏆 G'oliblar soni: <b>{state.get('winners_count')}</b>"
+        )
+        builder.row(InlineKeyboardButton(text="🛑 To'xtatish (g'olibni aniqlash)", callback_data="c2_stop"))
+    else:
+        text = (
+            "🎉 <b>KONKURS 2</b>\n\n"
+            "Holat: 🔴 Faol emas\n\n"
+            "Kanalga rasm/matn bilan e'lon qilinadigan, ishtirokchilar orasidan "
+            "TASODIFIY g'olib(lar) tanlanadigan konkurs yaratish uchun tugmani bosing."
+        )
+        builder.row(InlineKeyboardButton(text="🚀 Yangi konkurs yaratish", callback_data="c2_create"))
+
+    builder.row(InlineKeyboardButton(text="⬅️ Admin panelga qaytish", callback_data="adm_back"))
+    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    await callback.answer()
+
+
+@admin_router.callback_query(F.data == "c2_create")
+async def cb_c2_create(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(Contest2States.waiting_description)
+    await callback.message.edit_text(
+        "📝 <b>1/4</b> — Konkurs matnini (tavsifini, o'zbek tilida) yuboring:\n\n"
+        "Masalan: «🎉 Yangi konkurs! Sovg'a — 50000 so'm balans. Ishtirok etish uchun "
+        "kanallarga obuna bo'ling va pastdagi tugmani bosing!»",
+        reply_markup=back_to_admin_keyboard(),
+    )
+    await callback.answer()
+
+
+@admin_router.message(Contest2States.waiting_description)
+async def c2_process_description(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.update_data(description=message.text)
+    await state.set_state(Contest2States.waiting_channels)
+    await message.answer(
+        "📢 <b>2/4</b> — Majburiy obuna kanal(lar) linkini yuboring.\n"
+        "Bir nechta bo'lsa, har birini alohida qatorga yozing.\n\n"
+        "Masalan:\n<code>https://t.me/kanal1\nhttps://t.me/kanal2</code>\n\n"
+        "⚠️ Bot ushbu kanal(lar)da <b>admin</b> bo'lishi shart — chunki post shu yerga "
+        "yuboriladi va obuna shu yerdan tekshiriladi."
+    )
+
+
+@admin_router.message(Contest2States.waiting_channels)
+async def c2_process_channels(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    channels = _c2_parse_channels(message.text)
+    if not channels:
+        await message.answer("❌ Kamida bitta to'g'ri kanal linki yuboring.")
+        return
+    await state.update_data(channels=channels)
+    await state.set_state(Contest2States.waiting_winners_count)
+    await message.answer("🏆 <b>3/4</b> — Nechta odam g'olib bo'ladi? (son kiriting):")
+
+
+@admin_router.message(Contest2States.waiting_winners_count)
+async def c2_process_winners_count(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    text = message.text.strip()
+    if not text.isdigit() or int(text) < 1:
+        await message.answer("❌ Musbat butun son kiriting (masalan: 1, 2, 3...).")
+        return
+    await state.update_data(winners_count=int(text))
+    await state.set_state(Contest2States.waiting_photo)
+    await message.answer(
+        "🖼 <b>4/4</b> — Rasm yuboring (ixtiyoriy).\n"
+        "Agar rasmsiz, faqat matn bilan e'lon qilmoqchi bo'lsangiz — /skip deb yozing."
+    )
+
+
+async def _c2_finalize(message: Message, state: FSMContext, photo_file_id: str | None):
+    data = await state.get_data()
+    description = data["description"]
+    channels = data["channels"]
+    winners_count = data["winners_count"]
+    await state.clear()
+
+    lines = [description, "", "📢 <b>Majburiy obuna:</b>"]
+    for ch in channels:
+        lines.append(f"• {ch['url']}")
+    lines.append("")
+    lines.append(f"🏆 G'oliblar soni: <b>{winners_count}</b>")
+    lines.append("\nQatnashish uchun pastdagi <b>«🎉 Ishtirok etish»</b> tugmasini bosing!")
+    caption = "\n".join(lines)
+
+    builder = InlineKeyboardBuilder()
+    for ch in channels:
+        builder.row(InlineKeyboardButton(text=f"📢 {ch['chat_id']}", url=ch["url"]))
+    builder.row(InlineKeyboardButton(text="🎉 Ishtirok etish", callback_data="c2_join"))
+    markup = builder.as_markup()
+
+    posts = []
+    failed_channels = []
+    for ch in channels:
+        try:
+            if photo_file_id:
+                sent = await bot.send_photo(ch["chat_id"], photo=photo_file_id, caption=caption, reply_markup=markup)
+            else:
+                sent = await bot.send_message(ch["chat_id"], caption, reply_markup=markup)
+            posts.append({"chat_id": sent.chat.id, "message_id": sent.message_id, "has_photo": bool(photo_file_id)})
+        except Exception as e:
+            failed_channels.append(ch["chat_id"])
+            logger.warning(f"Konkurs 2 postini {ch['chat_id']} ga yuborishda xato: {e}")
+
+    await db.set_contest2_state(
+        active=True,
+        description=description,
+        channels=channels,
+        winners_count=winners_count,
+        photo_file_id=photo_file_id,
+        posts=posts,
+        participants=[],
+    )
+
+    status = f"✅ Konkurs 2 e'lon qilindi! {len(posts)} ta kanalga yuborildi."
+    if failed_channels:
+        status += (
+            f"\n⚠️ Quyidagi kanal(lar)ga yubora olmadim — bot u yerda admin emasligi mumkin: "
+            f"{', '.join(failed_channels)}"
+        )
+    await message.answer(status, reply_markup=back_to_admin_keyboard())
+
+
+@admin_router.message(Contest2States.waiting_photo, F.photo)
+async def c2_process_photo(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await _c2_finalize(message, state, message.photo[-1].file_id)
+
+
+@admin_router.message(Contest2States.waiting_photo, Command("skip"))
+async def c2_skip_photo(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await _c2_finalize(message, state, None)
+
+
+@admin_router.message(Contest2States.waiting_photo)
+async def c2_photo_fallback(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("🖼 Rasm yuboring, yoki rasmsiz o'tkazib yuborish uchun /skip deb yozing.")
+
+
+@user_router.callback_query(F.data == "c2_join")
+async def cb_c2_join(callback: CallbackQuery):
+    state = await db.get_contest2_state()
+    if not state.get("active"):
+        await callback.answer("❌ Bu konkurs hozircha faol emas yoki allaqachon yakunlangan.", show_alert=True)
+        return
+
+    user_id = callback.from_user.id
+    if await db.is_contest2_participant(user_id):
+        await callback.answer("✅ Siz allaqachon ishtirok etyapsiz!", show_alert=True)
+        return
+
+    not_subscribed = []
+    for ch in state.get("channels", []):
+        try:
+            member = await bot.get_chat_member(chat_id=ch["chat_id"], user_id=user_id)
+            if member.status in ("left", "kicked"):
+                not_subscribed.append(ch)
+        except Exception:
+            not_subscribed.append(ch)
+
+    if not_subscribed:
+        await callback.answer("❌ Avval barcha ko'rsatilgan kanallarga obuna bo'ling!", show_alert=True)
+        return
+
+    await db.add_contest2_participant(
+        user_id, callback.from_user.full_name, callback.from_user.username or ""
+    )
+    await callback.answer("🎉 Siz konkursda ishtirok etyapsiz! Omad tilaymiz!", show_alert=True)
+
+
+@admin_router.callback_query(F.data == "c2_stop")
+async def cb_c2_stop(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+
+    state = await db.get_contest2_state()
+    participants = state.get("participants", [])
+    winners_count = state.get("winners_count", 1)
+
+    if not participants:
+        await callback.message.edit_text(
+            "❌ Hozircha hech kim ishtirok etmagan, g'olib aniqlab bo'lmaydi.",
+            reply_markup=back_to_admin_keyboard(),
+        )
+        await callback.answer()
+        return
+
+    n = min(winners_count, len(participants))
+    winners = random.sample(participants, n)
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["🎉 <b>KONKURS YAKUNLANDI!</b> 🎉", "", "🏆 <b>G'oliblar:</b>"]
+    for i, w in enumerate(winners):
+        prefix = medals[i] if i < 3 else f"{i + 1}-o'rin"
+        mention = f"<a href='tg://user?id={w['user_id']}'>{w['name']}</a>"
+        lines.append(f"{prefix} {mention}")
+    lines.append("")
+    lines.append("🎁 Tabriklaymiz! Sovg'alaringiz uchun admin bilan bog'laning.")
+    result_text = "\n".join(lines)
+
+    for post in state.get("posts", []):
+        try:
+            if post.get("has_photo"):
+                await bot.edit_message_caption(
+                    chat_id=post["chat_id"], message_id=post["message_id"], caption=result_text
+                )
+            else:
+                await bot.edit_message_text(
+                    chat_id=post["chat_id"], message_id=post["message_id"], text=result_text
+                )
+        except Exception as e:
+            logger.warning(f"Konkurs 2 postini yangilashda xato: {e}")
+            try:
+                await bot.send_message(post["chat_id"], result_text)
+            except Exception:
+                pass
+
+    await db.reset_contest2()
+
+    await callback.message.edit_text(
+        f"{result_text}\n\n✅ Natija tegishli kanal(lar)ga e'lon qilindi.",
         reply_markup=back_to_admin_keyboard(),
     )
     await callback.answer()
