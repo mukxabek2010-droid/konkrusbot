@@ -76,6 +76,8 @@ BTN_BLOX_SERVICES = "🛠 Blox Fruit Xizmatlar"
 class AdminStates(StatesGroup):
     waiting_broadcast_text = State()
     waiting_channel_data = State()
+    waiting_gift_target = State()
+    waiting_gift_amount = State()
 
 
 def is_admin(user_id: int) -> bool:
@@ -414,6 +416,98 @@ async def cmd_admin(message: Message):
         return
     state = await db.get_contest_state()
     await message.answer("🛠 <b>Admin panel</b>", reply_markup=admin_panel_keyboard(state.get("running", False)))
+
+
+# ---- YASHIRIN BUYRUQ: /referal (hech qayerda ko'rsatilmaydi, admin panelida ham yo'q) ----
+# Faqat ADMIN_IDS ichidagi odam shu buyruqni bilib, yozsagina ishlaydi.
+# Boshqa har qanday odam (oddiy foydalanuvchi yoki hatto boshqa admin) buni yozsa ham,
+# bot sukut saqlaydi — hech qanday javob qaytmaydi, hech narsa oshkor bo'lmaydi.
+
+@admin_router.message(Command("referal"))
+async def cmd_secret_gift_referal(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.set_state(AdminStates.waiting_gift_target)
+    await message.answer(
+        "🎁 <b>Referal sovg'a bo'limi</b>\n\n"
+        "Foydalanuvchining ID raqamini yoki username'ini yuboring "
+        "(masalan: <code>123456789</code> yoki <code>@username</code>).\n\n"
+        "Bekor qilish uchun /bekor yozing."
+    )
+
+
+@admin_router.message(Command("bekor"))
+async def cmd_admin_cancel_any(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    current = await state.get_state()
+    if current:
+        await state.clear()
+        await message.answer("Bekor qilindi.")
+
+
+@admin_router.message(AdminStates.waiting_gift_target)
+async def process_gift_target(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+
+    text = message.text.strip()
+    target_user = None
+    if text.lstrip("-").isdigit():
+        target_user = await db.get_user(int(text))
+    else:
+        target_user = await db.get_user_by_username(text.lstrip("@"))
+
+    if not target_user:
+        await message.answer(
+            "❌ Bunday foydalanuvchi topilmadi (u botdan kamida bir marta /start bosgan bo'lishi kerak).\n"
+            "Qaytadan ID yoki username yuboring, yoki /bekor yozing."
+        )
+        return
+
+    name = target_user.get("full_name") or (
+        f"@{target_user['username']}" if target_user.get("username") else str(target_user["user_id"])
+    )
+    await state.update_data(target_user_id=target_user["user_id"], target_name=name)
+    await state.set_state(AdminStates.waiting_gift_amount)
+    await message.answer(
+        f"👤 Topildi: <b>{name}</b>\n\n"
+        f"Nechta referal sovg'a qilmoqchisiz? (1 dan 1000 gacha son kiriting):"
+    )
+
+
+@admin_router.message(AdminStates.waiting_gift_amount)
+async def process_gift_amount(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+
+    text = message.text.strip()
+    if not text.isdigit() or not (1 <= int(text) <= 1000):
+        await message.answer("❌ 1 dan 1000 gacha butun son kiriting, yoki /bekor yozing.")
+        return
+
+    amount = int(text)
+    data = await state.get_data()
+    target_user_id = data["target_user_id"]
+    target_name = data["target_name"]
+
+    await db.add_referral_amount(target_user_id, amount)
+    await state.clear()
+
+    updated = await db.get_user(target_user_id)
+    await message.answer(
+        f"✅ <b>{target_name}</b> ga <b>{amount}</b> ta referal sovg'a qilindi!\n\n"
+        f"Joriy tur hisobi: <b>{updated['referral_count']}</b>\n"
+        f"Umumiy (hammavaqtgi) hisobi: <b>{updated['total_referral_count']}</b>"
+    )
+
+    try:
+        await bot.send_message(
+            target_user_id,
+            f"🎁 Tabriklaymiz! Sizga sovg'a sifatida <b>{amount}</b> ta referal qo'shildi!",
+        )
+    except Exception:
+        pass
 
 
 @admin_router.callback_query(F.data == "adm_back")
