@@ -5,7 +5,7 @@ Render "Web Service" + MongoDB Atlas uchun moslashtirilgan.
 
 Kerakli muhit o'zgaruvchilari (Render -> Environment):
     BOT_TOKEN     - @BotFather dan olingan token (SHART)
-    ADMIN_IDS     - admin(lar)ning Telegram ID raqami, vergul bilan: "111,222" (SHART)
+    ADMIN_IDS     - 8532117429,
     BOT_USERNAME  - bot username'i, @ belgisiz (SHART)
     MONGO_URI     - MongoDB ulanish manzili (SHART)
     PYTHON_VERSION - 3.11.9 (Render uchun)
