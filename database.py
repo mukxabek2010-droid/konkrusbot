@@ -25,6 +25,7 @@ _db = _client[DB_NAME]
 users_col = _db["users"]
 channels_col = _db["channels"]
 settings_col = _db["settings"]
+contest2_col = _db["contest2"]
 
 
 async def init_db():
@@ -187,5 +188,52 @@ async def clear_contest_state():
     await settings_col.update_one(
         {"_id": "contest"},
         {"$set": {"running": False, "chat_id": None, "message_id": None}},
+        upsert=True,
+    )
+
+
+# ---------------- KONKURS 2 (kanalga post + tasodifiy g'olib tanlash) ----------------
+# Bu birinchi (referal) konkursdan mustaqil tizim: admin post yasaydi, kanal(lar)ga
+# yuboradi, odamlar "Ishtirok etish" tugmasini bosib qatnashadi, to'xtatilganda
+# ular orasidan TASODIFIY g'olib(lar) tanlanadi.
+
+_CONTEST2_DEFAULT = {
+    "_id": "contest2",
+    "active": False,
+    "description": None,
+    "channels": [],       # [{"chat_id": "@kanal", "url": "https://t.me/kanal"}, ...]
+    "winners_count": 1,
+    "photo_file_id": None,
+    "posts": [],           # [{"chat_id": ..., "message_id": ..., "has_photo": bool}, ...]
+    "participants": [],    # [{"user_id": ..., "name": ..., "username": ...}, ...]
+}
+
+
+async def get_contest2_state():
+    doc = await contest2_col.find_one({"_id": "contest2"})
+    if not doc:
+        return dict(_CONTEST2_DEFAULT)
+    return doc
+
+
+async def set_contest2_state(**kwargs):
+    await contest2_col.update_one({"_id": "contest2"}, {"$set": kwargs}, upsert=True)
+
+
+async def reset_contest2():
+    data = dict(_CONTEST2_DEFAULT)
+    data.pop("_id")
+    await contest2_col.update_one({"_id": "contest2"}, {"$set": data}, upsert=True)
+
+
+async def is_contest2_participant(user_id: int) -> bool:
+    doc = await contest2_col.find_one({"_id": "contest2", "participants.user_id": user_id})
+    return doc is not None
+
+
+async def add_contest2_participant(user_id: int, name: str, username: str):
+    await contest2_col.update_one(
+        {"_id": "contest2"},
+        {"$push": {"participants": {"user_id": user_id, "name": name, "username": username}}},
         upsert=True,
     )
