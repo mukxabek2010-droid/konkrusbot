@@ -71,6 +71,8 @@ BTN_LINK = "🔗 Referal havolam"
 BTN_TOP = "🏆 Reyting"
 BTN_FRUIT_VALUE = "🍓 Fruit Value"
 BTN_BLOX_SERVICES = "🛠 Blox Fruit Xizmatlar"
+BTN_DISCORD = "💬 Discord"
+DISCORD_INVITE_URL = "https://discord.gg/fsWEG8SBZ"
 
 
 class AdminStates(StatesGroup):
@@ -101,6 +103,7 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text=BTN_STATS), KeyboardButton(text=BTN_LINK)],
             [KeyboardButton(text=BTN_TOP)],
             [KeyboardButton(text=BTN_FRUIT_VALUE), KeyboardButton(text=BTN_BLOX_SERVICES)],
+            [KeyboardButton(text=BTN_DISCORD)],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -400,6 +403,16 @@ async def btn_fruit_value(message: Message):
 @user_router.message(F.text == BTN_BLOX_SERVICES)
 async def btn_blox_services(message: Message):
     await message.answer("🛠 Bu bo'lim hozircha ta'mirlanmoqda. Tez orada qo'shiladi!")
+
+
+@user_router.message(F.text == BTN_DISCORD)
+async def btn_discord(message: Message):
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="💬 Discord'ga kirish", url=DISCORD_INVITE_URL))
+    await message.answer(
+        "Bizning Discord serverimizga qo'shiling! 👇",
+        reply_markup=builder.as_markup(),
+    )
 
 
 @user_router.message(Command("top"))
