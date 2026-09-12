@@ -21,7 +21,7 @@ from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton, WebAppInfo,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
@@ -50,6 +50,9 @@ LEADERBOARD_INTERVAL_SECONDS = 60  # har 1 daqiqada yangilanadi
 SELF_URL = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("SELF_URL", "")
 SELF_PING_INTERVAL_SECONDS = 4 * 60  # har 4 daqiqada
 
+# "Fruit Value" bo'limida ochiladigan WebApp havolasi (Render -> Environment -> FRUIT_VALUE_URL)
+FRUIT_VALUE_URL = os.getenv("FRUIT_VALUE_URL", "https://example.com")
+
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN muhit o'zgaruvchisi topilmadi! Render -> Environment bo'limida qo'shing.")
 
@@ -66,6 +69,8 @@ leaderboard_task: asyncio.Task | None = None
 BTN_STATS = "📊 Statistika"
 BTN_LINK = "🔗 Referal havolam"
 BTN_TOP = "🏆 Reyting"
+BTN_FRUIT_VALUE = "🍓 Fruit Value"
+BTN_BLOX_SERVICES = "🛠 Blox Fruit Xizmatlar"
 
 
 class AdminStates(StatesGroup):
@@ -93,6 +98,7 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text=BTN_STATS), KeyboardButton(text=BTN_LINK)],
             [KeyboardButton(text=BTN_TOP)],
+            [KeyboardButton(text=BTN_FRUIT_VALUE), KeyboardButton(text=BTN_BLOX_SERVICES)],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -377,6 +383,21 @@ async def btn_stats(message: Message):
 async def btn_alltime_top(message: Message):
     top10 = await db.get_top_referrers(10, field="total_referral_count")
     await message.answer(format_alltime_top_text(top10))
+
+
+@user_router.message(F.text == BTN_FRUIT_VALUE)
+async def btn_fruit_value(message: Message):
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="💎 Value", web_app=WebAppInfo(url=FRUIT_VALUE_URL)))
+    await message.answer(
+        "🍓 <b>Fruit Value</b>\n\nValuelarni bilish uchun pastdagi tugmani bosing:",
+        reply_markup=builder.as_markup(),
+    )
+
+
+@user_router.message(F.text == BTN_BLOX_SERVICES)
+async def btn_blox_services(message: Message):
+    await message.answer("🛠 Bu bo'lim hozircha ta'mirlanmoqda. Tez orada qo'shiladi!")
 
 
 @user_router.message(Command("top"))
