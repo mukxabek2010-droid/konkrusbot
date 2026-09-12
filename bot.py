@@ -4,20 +4,25 @@ Referal-konkurs Telegram boti.
 Render "Web Service" + MongoDB Atlas uchun moslashtirilgan.
 
 Kerakli muhit o'zgaruvchilari (Render -> Environment):
-    BOT_TOKEN     - 8842754251:AAEe-w4OUzSc0CJip0KVdrwIBq_xW9D6xUo
-    ADMIN_IDS     - 8866852203
-    BOT_USERNAME  - Bloxfruitkonkurs_bot
-    MONGO_URI     - MongoDB ulanish manzili (ixtiyoriy, kodda standart qiymat bor)
+    BOT_TOKEN     - @BotFather dan olingan token (SHART)
+    ADMIN_IDS     - admin(lar)ning Telegram ID raqami, vergul bilan: "111,222" (SHART)
+    BOT_USERNAME  - bot username'i, @ belgisiz (SHART)
+    MONGO_URI     - MongoDB ulanish manzili (SHART)
+    PYTHON_VERSION - 3.11.9 (Render uchun)
     PORT          - Render avtomatik beradi, o'zingiz sozlamang
 """
 import asyncio
 import logging
 import os
+from datetime import datetime
 
-from aiohttp import web
+from aiohttp import web, ClientSession, ClientTimeout
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, CallbackQuery, InlineKeyboardButton
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -37,6 +42,13 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x]
 PORT = int(os.getenv("PORT", "10000"))
+LEADERBOARD_INTERVAL_SECONDS = 60  # har 1 daqiqada yangilanadi
+
+# Bot uxlab qolmasligi uchun o'zini-o'zi "chaqirib" turadigan manzil.
+# Render bu o'zgaruvchini avtomatik beradi (masalan https://konkrusbot.onrender.com).
+# Agar berilmasa, SELF_URL orqali qo'lda ham ko'rsatish mumkin.
+SELF_URL = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("SELF_URL", "")
+SELF_PING_INTERVAL_SECONDS = 4 * 60  # har 4 daqiqada
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN muhit o'zgaruvchisi topilmadi! Render -> Environment bo'limida qo'shing.")
@@ -46,6 +58,14 @@ dp = Dispatcher(storage=MemoryStorage())
 
 user_router = Router()
 admin_router = Router()
+
+# Fon vazifasi (har daqiqada TOP-3 ni yangilab turadi)
+leaderboard_task: asyncio.Task | None = None
+
+# Pastki menyu tugmalari matni (shu matnlarni handler'lar aniqlaydi)
+BTN_STATS = "📊 Statistika"
+BTN_LINK = "🔗 Referal havolam"
+BTN_TOP = "🏆 Reyting"
 
 
 class AdminStates(StatesGroup):
@@ -67,22 +87,42 @@ def subscription_keyboard(channels):
     return builder.as_markup()
 
 
-def main_menu_keyboard():
-    builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="🔗 Referal havolam", callback_data="my_link"))
-    builder.row(InlineKeyboardButton(text="🏆 Reyting (TOP-10)", callback_data="top_list"))
-    builder.row(InlineKeyboardButton(text="📊 Mening statistikam", callback_data="my_stats"))
-    return builder.as_markup()
+def main_menu_keyboard() -> ReplyKeyboardMarkup:
+    """Pastda doimiy ko'rinadigan menyu (inline emas, pastki reply-menyu)."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_STATS), KeyboardButton(text=BTN_LINK)],
+            [KeyboardButton(text=BTN_TOP)],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
 
 
-def admin_panel_keyboard():
+def admin_panel_keyboard(contest_running: bool):
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="📊 Umumiy statistika", callback_data="adm_stats"))
     builder.row(InlineKeyboardButton(text="📋 Kanallar ro'yxati", callback_data="adm_channels"))
     builder.row(InlineKeyboardButton(text="➕ Kanal qo'shish", callback_data="adm_add_channel"))
     builder.row(InlineKeyboardButton(text="📢 Xabar yuborish (broadcast)", callback_data="adm_broadcast"))
-    builder.row(InlineKeyboardButton(text="🏆 G'oliblarni e'lon qilish", callback_data="adm_winners"))
-    builder.row(InlineKeyboardButton(text="🔄 Konkursni qayta boshlash", callback_data="adm_reset"))
+
+    if contest_running:
+        builder.row(InlineKeyboardButton(text="🟢 Konkurs jarayonda (to'xtatish)", callback_data="adm_stop_contest"))
+    else:
+        builder.row(InlineKeyboardButton(text="🚀 Konkursni boshlash", callback_data="adm_start_contest"))
+
+    builder.row(InlineKeyboardButton(text="🏆 G'olibni e'lon qilish", callback_data="adm_declare_winner"))
+    builder.row(InlineKeyboardButton(text="🔄 Joriy hisobni qo'lda nolga tushirish", callback_data="adm_reset"))
+    return builder.as_markup()
+
+
+def winner_count_keyboard():
+    builder = InlineKeyboardBuilder()
+    row1 = [InlineKeyboardButton(text=str(i), callback_data=f"winnum_{i}") for i in range(1, 6)]
+    row2 = [InlineKeyboardButton(text=str(i), callback_data=f"winnum_{i}") for i in range(6, 11)]
+    builder.row(*row1)
+    builder.row(*row2)
+    builder.row(InlineKeyboardButton(text="❌ Bekor qilish", callback_data="adm_cancel"))
     return builder.as_markup()
 
 
@@ -135,9 +175,9 @@ async def send_welcome(chat_id: int):
     text = (
         "👋 Xush kelibsiz!\n\n"
         "Bu konkurs-bot orqali siz do'stlaringizni taklif qilib, sovg'alar yutish imkoniyatiga ega bo'lasiz.\n\n"
-        "🔗 <b>Referal havolam</b> — shaxsiy havolangizni olish\n"
-        "🏆 <b>Reyting</b> — eng ko'p referal yig'gan ishtirokchilar\n"
-        "📊 <b>Mening statistikam</b> — sizning natijangiz\n\n"
+        f"{BTN_LINK} — shaxsiy havolangizni olish\n"
+        f"{BTN_STATS} — sizning joriy natijangiz va TOP ishtirokchilar\n"
+        f"{BTN_TOP} — umumiy (hech qachon nollanmaydigan) reyting\n\n"
         "Do'stingiz sizning havolangiz orqali botga kirib, barcha kanallarga obuna bo'lsa, "
         "sizning hisobingizga +1 referal qo'shiladi. Omad!"
     )
@@ -155,16 +195,97 @@ async def notify_referrer(referrer_id: int):
         pass
 
 
-def format_top_text(top_rows) -> str:
+def format_top_text(top_rows, title: str) -> str:
+    if not top_rows:
+        return f"{title}\n\nHozircha reytingda hech kim yo'q."
+    medals = ["🥇", "🥈", "🥉"]
+    lines = [f"{title}\n"]
+    for i, row in enumerate(top_rows):
+        prefix = medals[i] if i < 3 else f"{i + 1}."
+        name = row.get("full_name") or (f"@{row['username']}" if row.get("username") else str(row["user_id"]))
+        count = row.get("referral_count") if "referral_count" in row else row.get("total_referral_count", 0)
+        lines.append(f"{prefix} {name} — <b>{count}</b> ta referal")
+    return "\n".join(lines)
+
+
+def format_round_top_text(top_rows) -> str:
     if not top_rows:
         return "Hozircha reytingda hech kim yo'q."
     medals = ["🥇", "🥈", "🥉"]
-    lines = ["🏆 <b>TOP-10 ishtirokchilar:</b>\n"]
+    lines = ["🏆 <b>TOP-10 (joriy konkurs turi):</b>\n"]
     for i, row in enumerate(top_rows):
         prefix = medals[i] if i < 3 else f"{i + 1}."
         name = row.get("full_name") or (f"@{row['username']}" if row.get("username") else str(row["user_id"]))
         lines.append(f"{prefix} {name} — <b>{row['referral_count']}</b> ta referal")
     return "\n".join(lines)
+
+
+def format_alltime_top_text(top_rows) -> str:
+    if not top_rows:
+        return "Hozircha reytingda hech kim yo'q."
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["🏆 <b>Umumiy reyting (hammavaqtgi):</b>", "<i>Faqat maqtanish uchun — bu hech qachon nollanmaydi 😉</i>\n"]
+    for i, row in enumerate(top_rows):
+        prefix = medals[i] if i < 3 else f"{i + 1}."
+        name = row.get("full_name") or (f"@{row['username']}" if row.get("username") else str(row["user_id"]))
+        lines.append(f"{prefix} {name} — <b>{row['total_referral_count']}</b> ta referal")
+    return "\n".join(lines)
+
+
+def build_live_leaderboard_text(top3, finished: bool = False) -> str:
+    now = datetime.now().strftime("%H:%M:%S")
+    header = "🏁 <b>Konkurs yakunlandi!</b>" if finished else "🔥 <b>Konkurs jarayonda!</b> 🔥"
+    lines = [header, "", "Hozirgi TOP-3:"]
+    medals = ["🥇", "🥈", "🥉"]
+    if not top3:
+        lines.append("Hali hech kim referal yig'magan.")
+    else:
+        for i, row in enumerate(top3):
+            name = row.get("full_name") or (f"@{row['username']}" if row.get("username") else str(row["user_id"]))
+            lines.append(f"{medals[i]} {name} — <b>{row['referral_count']}</b> ta referal")
+    if not finished:
+        lines.append("")
+        lines.append(f"🕐 Har {LEADERBOARD_INTERVAL_SECONDS} soniyada yangilanadi. Oxirgi yangilanish: {now}")
+    return "\n".join(lines)
+
+
+# ---------------- LIVE TOP-3 FON VAZIFASI ----------------
+
+async def leaderboard_updater():
+    """Konkurs davomida har LEADERBOARD_INTERVAL_SECONDS da TOP-3 xabarini yangilaydi."""
+    try:
+        while True:
+            await asyncio.sleep(LEADERBOARD_INTERVAL_SECONDS)
+            state = await db.get_contest_state()
+            if not state.get("running"):
+                break
+            chat_id = state.get("chat_id")
+            message_id = state.get("message_id")
+            if not chat_id or not message_id:
+                break
+            top3 = await db.get_top_referrers(3, field="referral_count")
+            text = build_live_leaderboard_text(top3, finished=False)
+            try:
+                await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
+            except TelegramBadRequest:
+                pass
+            except Exception as e:
+                logger.warning(f"Leaderboard yangilashda xato: {e}")
+    except asyncio.CancelledError:
+        pass
+
+
+def ensure_leaderboard_task_running():
+    global leaderboard_task
+    if leaderboard_task is None or leaderboard_task.done():
+        leaderboard_task = asyncio.create_task(leaderboard_updater())
+
+
+async def stop_leaderboard_task():
+    global leaderboard_task
+    if leaderboard_task and not leaderboard_task.done():
+        leaderboard_task.cancel()
+    leaderboard_task = None
 
 
 # ---------------- FOYDALANUVCHI QISMI ----------------
@@ -214,51 +335,54 @@ async def cb_check_subscription(callback: CallbackQuery):
     await send_welcome(callback.message.chat.id)
 
 
-@user_router.callback_query(F.data == "my_link")
-async def cb_my_link(callback: CallbackQuery):
-    user_id = callback.from_user.id
+@user_router.message(F.text == BTN_LINK)
+async def btn_my_link(message: Message):
+    user_id = message.from_user.id
     link = f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
     user = await db.get_user(user_id)
     count = user["referral_count"] if user else 0
     text = (
         f"🔗 <b>Sizning shaxsiy referal havolangiz:</b>\n\n"
         f"<code>{link}</code>\n\n"
-        f"Hozirgi referallar soni: <b>{count}</b>\n\n"
+        f"Joriy konkursdagi referallar soni: <b>{count}</b>\n\n"
         f"Ushbu havolani do'stlaringizga yuboring. Ular bot orqali kirib, "
         f"kanallarga obuna bo'lishsa, hisobingizga referal qo'shiladi."
     )
-    await callback.message.answer(text)
-    await callback.answer()
+    await message.answer(text)
 
 
-@user_router.callback_query(F.data == "top_list")
-async def cb_top_list(callback: CallbackQuery):
-    top = await db.get_top_referrers(10)
-    await callback.message.answer(format_top_text(top))
-    await callback.answer()
-
-
-@user_router.callback_query(F.data == "my_stats")
-async def cb_my_stats(callback: CallbackQuery):
-    user_id = callback.from_user.id
+@user_router.message(F.text == BTN_STATS)
+async def btn_stats(message: Message):
+    user_id = message.from_user.id
     user = await db.get_user(user_id)
     if not user:
-        await callback.answer("Xatolik yuz berdi, /start bosing.", show_alert=True)
+        await message.answer("Xatolik yuz berdi, /start bosing.")
         return
 
-    top = await db.get_top_referrers(100000)
-    rank = next((i + 1 for i, row in enumerate(top) if row["user_id"] == user_id), None)
+    rank = await db.get_user_rank(user_id, field="referral_count")
+    top10 = await db.get_top_referrers(10, field="referral_count")
 
-    text = f"📊 <b>Sizning statistikangiz:</b>\n\nReferallar soni: <b>{user['referral_count']}</b>\n"
-    text += f"Reytingdagi o'rningiz: <b>{rank}</b>" if rank else "Siz hali reytingda emassiz."
-    await callback.message.answer(text)
-    await callback.answer()
+    lines = [
+        "📊 <b>Sizning statistikangiz (joriy konkurs):</b>\n",
+        f"Referallar soni: <b>{user['referral_count']}</b>",
+    ]
+    lines.append(f"Reytingdagi o'rningiz: <b>{rank}</b>" if rank else "Siz hali reytingda emassiz.")
+    lines.append("")
+    lines.append(format_round_top_text(top10))
+
+    await message.answer("\n".join(lines))
+
+
+@user_router.message(F.text == BTN_TOP)
+async def btn_alltime_top(message: Message):
+    top10 = await db.get_top_referrers(10, field="total_referral_count")
+    await message.answer(format_alltime_top_text(top10))
 
 
 @user_router.message(Command("top"))
 async def cmd_top(message: Message):
-    top = await db.get_top_referrers(10)
-    await message.answer(format_top_text(top))
+    top10 = await db.get_top_referrers(10, field="total_referral_count")
+    await message.answer(format_alltime_top_text(top10))
 
 
 # ---------------- ADMIN QISMI ----------------
@@ -267,7 +391,8 @@ async def cmd_top(message: Message):
 async def cmd_admin(message: Message):
     if not is_admin(message.from_user.id):
         return
-    await message.answer("🛠 <b>Admin panel</b>", reply_markup=admin_panel_keyboard())
+    state = await db.get_contest_state()
+    await message.answer("🛠 <b>Admin panel</b>", reply_markup=admin_panel_keyboard(state.get("running", False)))
 
 
 @admin_router.callback_query(F.data == "adm_back")
@@ -275,7 +400,11 @@ async def cb_adm_back(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return
     await state.clear()
-    await callback.message.edit_text("🛠 <b>Admin panel</b>", reply_markup=admin_panel_keyboard())
+    contest_state = await db.get_contest_state()
+    await callback.message.edit_text(
+        "🛠 <b>Admin panel</b>",
+        reply_markup=admin_panel_keyboard(contest_state.get("running", False)),
+    )
     await callback.answer()
 
 
@@ -295,11 +424,14 @@ async def cb_adm_stats(callback: CallbackQuery):
     total = await db.get_total_users()
     confirmed = await db.get_confirmed_users_count()
     channels_count = len(await db.get_channels())
+    contest_state = await db.get_contest_state()
+    running_text = "🟢 Ha, jarayonda" if contest_state.get("running") else "🔴 Yo'q"
     text = (
         f"📊 <b>Umumiy statistika</b>\n\n"
         f"👥 Jami foydalanuvchilar: <b>{total}</b>\n"
         f"✅ Obunani tasdiqlaganlar: <b>{confirmed}</b>\n"
-        f"📢 Majburiy kanallar soni: <b>{channels_count}</b>"
+        f"📢 Majburiy kanallar soni: <b>{channels_count}</b>\n"
+        f"🎯 Konkurs holati: <b>{running_text}</b>"
     )
     await callback.message.edit_text(text, reply_markup=back_to_admin_keyboard())
     await callback.answer()
@@ -371,59 +503,144 @@ async def cb_adm_broadcast(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+async def broadcast_message_copy(source_message: Message) -> tuple[int, int]:
+    """source_message ni barcha foydalanuvchilarga nusxalab yuboradi. (sent, failed) qaytaradi."""
+    user_ids = await db.get_all_user_ids()
+    sent, failed = 0, 0
+    for uid in user_ids:
+        try:
+            await source_message.copy_to(chat_id=uid)
+            sent += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)
+    return sent, failed
+
+
+async def broadcast_text_to_all(text: str) -> tuple[int, int]:
+    """Oddiy matnli xabarni barcha foydalanuvchilarga yuboradi. (sent, failed) qaytaradi."""
+    user_ids = await db.get_all_user_ids()
+    sent, failed = 0, 0
+    for uid in user_ids:
+        try:
+            await bot.send_message(uid, text)
+            sent += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)
+    return sent, failed
+
+
 @admin_router.message(AdminStates.waiting_broadcast_text)
 async def process_broadcast(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
     await state.clear()
-    user_ids = await db.get_all_user_ids()
-    sent, failed = 0, 0
-    status_msg = await message.answer(f"⏳ Yuborilmoqda... (0/{len(user_ids)})")
-
-    for i, uid in enumerate(user_ids, 1):
-        try:
-            await message.copy_to(chat_id=uid)
-            sent += 1
-        except Exception:
-            failed += 1
-        if i % 25 == 0:
-            try:
-                await status_msg.edit_text(f"⏳ Yuborilmoqda... ({i}/{len(user_ids)})")
-            except Exception:
-                pass
-        await asyncio.sleep(0.05)
-
+    status_msg = await message.answer("⏳ Yuborilmoqda...")
+    sent, failed = await broadcast_message_copy(message)
     await status_msg.edit_text(
         f"✅ Xabar yuborish yakunlandi.\n\n✅ Yuborildi: {sent}\n❌ Xato: {failed}",
         reply_markup=back_to_admin_keyboard(),
     )
 
 
-@admin_router.callback_query(F.data == "adm_winners")
-async def cb_adm_winners(callback: CallbackQuery):
+# ---- Konkursni boshlash / to'xtatish ----
+
+@admin_router.callback_query(F.data == "adm_start_contest")
+async def cb_adm_start_contest(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
-    top2 = await db.get_top_referrers(2)
-    if not top2:
+
+    top3 = await db.get_top_referrers(3, field="referral_count")
+    text = build_live_leaderboard_text(top3, finished=False)
+    msg = await bot.send_message(callback.message.chat.id, text)
+    await db.set_contest_state(running=True, chat_id=msg.chat.id, message_id=msg.message_id)
+    ensure_leaderboard_task_running()
+
+    await callback.message.edit_text(
+        "🚀 Konkurs boshlandi! TOP-3 xabari yuborildi va har "
+        f"{LEADERBOARD_INTERVAL_SECONDS} soniyada avtomatik yangilanadi.",
+        reply_markup=admin_panel_keyboard(True),
+    )
+    await callback.answer()
+
+
+@admin_router.callback_query(F.data == "adm_stop_contest")
+async def cb_adm_stop_contest(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    await stop_leaderboard_task()
+    await db.set_contest_state(running=False)
+    await callback.message.edit_text(
+        "🛑 Konkurs to'xtatildi (g'olib e'lon qilinmadi, hisoblar o'zgarmadi).",
+        reply_markup=admin_panel_keyboard(False),
+    )
+    await callback.answer()
+
+
+# ---- G'olibni e'lon qilish ----
+
+@admin_router.callback_query(F.data == "adm_declare_winner")
+async def cb_adm_declare_winner(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    await callback.message.edit_text(
+        "🏆 Nechta g'olib bo'lishi kerak? (1 dan 10 gacha)\n\n"
+        "Eng ko'p referal yig'gan ishtirokchilar tanlanadi.",
+        reply_markup=winner_count_keyboard(),
+    )
+    await callback.answer()
+
+
+@admin_router.callback_query(F.data.startswith("winnum_"))
+async def cb_winnum(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+
+    n = int(callback.data.replace("winnum_", ""))
+    top_n = await db.get_top_referrers(n, field="referral_count")
+
+    if not top_n:
         await callback.message.edit_text(
-            "Hozircha g'oliblarni aniqlash uchun yetarli ma'lumot yo'q.",
+            "Hozircha g'oliblarni aniqlash uchun yetarli ma'lumot yo'q "
+            "(hech kim referal yig'magan).",
             reply_markup=back_to_admin_keyboard(),
         )
         await callback.answer()
         return
 
-    medals = ["🥇", "🥈"]
-    winners_lines = ["🏆 <b>KONKURS G'OLIBLARI!</b> 🏆\n"]
-    for i, row in enumerate(top2):
-        name = row.get("full_name") or (f"@{row['username']}" if row.get("username") else str(row["user_id"]))
-        winners_lines.append(f"{medals[i]} {name} — <b>{row['referral_count']}</b> ta referal")
+    # Live-yangilanishni to'xtatamiz va yakuniy holatga o'zgartiramiz
+    state = await db.get_contest_state()
+    await stop_leaderboard_task()
+    if state.get("chat_id") and state.get("message_id"):
+        try:
+            final_text = build_live_leaderboard_text(top_n[:3], finished=True)
+            await bot.edit_message_text(
+                chat_id=state["chat_id"], message_id=state["message_id"], text=final_text
+            )
+        except Exception:
+            pass
+    await db.clear_contest_state()
 
-    winners_text = "\n".join(winners_lines) + "\n\n🎁 Tabriklaymiz! Sovg'alaringiz uchun admin bilan bog'laning."
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["🏆 <b>KONKURS G'OLIBLARI!</b> 🏆\n"]
+    for i, row in enumerate(top_n):
+        prefix = medals[i] if i < 3 else f"{i + 1}-o'rin"
+        name = row.get("full_name") or (f"@{row['username']}" if row.get("username") else str(row["user_id"]))
+        lines.append(f"{prefix} {name} — <b>{row['referral_count']}</b> ta referal")
+    winners_text = "\n".join(lines) + "\n\n🎁 Tabriklaymiz! Sovg'alaringiz uchun admin bilan bog'laning."
+
+    await callback.message.edit_text("⏳ G'oliblar e'lon qilinmoqda va barchaga yuborilmoqda...")
+
+    sent, failed = await broadcast_text_to_all(winners_text)
+
+    # Joriy tur hisobini nolga tushiramiz (umumiy/umrbod reyting o'zgarmaydi)
+    await db.reset_current_round()
 
     await callback.message.edit_text(
-        "\n".join(winners_lines) + "\n\nUshbu e'lonni barcha foydalanuvchilarga yuborish uchun "
-        "\"📢 Xabar yuborish\" bo'limidan foydalanib, shu matnni joylashtiring:\n\n"
-        f"<code>{winners_text}</code>",
+        f"{winners_text}\n\n"
+        f"📤 Xabar yuborildi: {sent} ta foydalanuvchiga (xato: {failed})\n"
+        f"🔄 Joriy tur hisoblari nolga tushirildi. Umumiy reyting o'zgarmadi.",
         reply_markup=back_to_admin_keyboard(),
     )
     await callback.answer()
@@ -434,8 +651,8 @@ async def cb_adm_reset(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     await callback.message.edit_text(
-        "⚠️ Haqiqatan ham barcha ishtirokchilarning referal hisoblarini nolga tushirmoqchimisiz? "
-        "Bu amalni ortga qaytarib bo'lmaydi.",
+        "⚠️ Haqiqatan ham barcha ishtirokchilarning JORIY TUR referal hisoblarini nolga "
+        "tushirmoqchimisiz? (Umumiy reytingga tegmaydi). Bu amalni ortga qaytarib bo'lmaydi.",
         reply_markup=confirm_cancel_keyboard("adm_reset_confirm"),
     )
     await callback.answer()
@@ -445,18 +662,15 @@ async def cb_adm_reset(callback: CallbackQuery):
 async def cb_adm_reset_confirm(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
-    await db.reset_contest()
+    await db.reset_current_round()
     await callback.message.edit_text(
-        "✅ Konkurs qayta boshlandi. Barcha referal hisoblari nolga tushirildi.",
+        "✅ Joriy tur referal hisoblari nolga tushirildi. Umumiy reyting o'zgarmadi.",
         reply_markup=back_to_admin_keyboard(),
     )
     await callback.answer()
 
 
 # ---------------- RENDER UCHUN HTTP SERVER (health-check) ----------------
-# Render "Web Service" muhitida ilova $PORT portini tinglashi shart, aks holda
-# deploy "muvaffaqiyatsiz" deb belgilanadi. Shu sababli botni polling rejimida
-# ishlatib, yonida shu kichik HTTP serverni ham ko'taramiz.
 
 async def health(request):
     return web.Response(text="Bot ishlayapti ✅")
@@ -472,6 +686,32 @@ async def run_http_server():
     logger.info(f"HTTP server {PORT}-portda ishga tushdi (Render health-check uchun).")
 
 
+async def self_ping_loop():
+    """
+    Render'ning bepul tarifi ~15 daqiqa harakatsizlikdan keyin servisni "uxlatib" qo'yadi.
+    Buning oldini olish uchun bot har SELF_PING_INTERVAL_SECONDS da o'zining ochiq
+    HTTP manziliga so'rov yuborib turadi.
+    """
+    if not SELF_URL:
+        logger.warning(
+            "SELF_URL/RENDER_EXTERNAL_URL topilmadi — self-ping o'chirilgan. "
+            "Render Environment'da avtomatik berilishi kerak, aks holda SELF_URL ni qo'lda qo'shing."
+        )
+        return
+
+    url = SELF_URL.rstrip("/") + "/"
+    timeout = ClientTimeout(total=15)
+
+    while True:
+        await asyncio.sleep(SELF_PING_INTERVAL_SECONDS)
+        try:
+            async with ClientSession(timeout=timeout) as session:
+                async with session.get(url) as resp:
+                    logger.info(f"Self-ping: {url} -> {resp.status}")
+        except Exception as e:
+            logger.warning(f"Self-ping xatosi: {e}")
+
+
 # ---------------- ISHGA TUSHIRISH ----------------
 
 async def main():
@@ -481,6 +721,14 @@ async def main():
 
     await bot.delete_webhook(drop_pending_updates=True)
     await run_http_server()
+    asyncio.create_task(self_ping_loop())
+
+    # Agar bot qayta ishga tushgan bo'lsa va konkurs "running" holatda qolgan bo'lsa,
+    # live-yangilanishni davom ettiramiz.
+    state = await db.get_contest_state()
+    if state.get("running") and state.get("chat_id") and state.get("message_id"):
+        ensure_leaderboard_task_running()
+        logger.info("Konkurs live-yangilanishi davom ettirildi.")
 
     logger.info("Bot ishga tushdi (polling rejimida).")
     await dp.start_polling(bot)
