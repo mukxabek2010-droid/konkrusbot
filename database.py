@@ -124,6 +124,24 @@ async def reset_current_round():
     await users_col.update_many({}, {"$set": {"referral_count": 0}})
 
 
+async def get_user_by_username(username: str):
+    """Username orqali (katta-kichik harflarga sezgir bo'lmagan holda) foydalanuvchini topadi."""
+    import re
+    pattern = f"^{re.escape(username)}$"
+    return await users_col.find_one({"username": {"$regex": pattern, "$options": "i"}})
+
+
+async def add_referral_amount(user_id: int, amount: int):
+    """
+    Admin tomonidan qo'lda sovg'a sifatida referal qo'shish uchun.
+    Ham joriy tur hisobiga, ham umrbod hisobga qo'shadi.
+    """
+    await users_col.update_one(
+        {"user_id": user_id},
+        {"$inc": {"referral_count": amount, "total_referral_count": amount}},
+    )
+
+
 # ---------------- CHANNELS (majburiy obuna) ----------------
 
 async def add_channel(chat_id: str, title: str, url: str):
